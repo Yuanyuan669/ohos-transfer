@@ -1,0 +1,15 @@
+build-artifacts/
+signing/
+entry/build/
+.hvigor/
+oh_modules/
+node_modules/
+*.hap
+*.app
+.keep
+hilog.txt
+layout*.json
+test-*.bin
+test-note.txt
+pulled/
+docs/*.jpeg

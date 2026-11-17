@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "LAN file transfer"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "LAN file transfer"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "快传"
+    }
+  ]
+}

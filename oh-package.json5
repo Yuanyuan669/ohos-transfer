@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "ohos-kiosk",
+  "version": "1.0.0",
+  "description": "OpenHarmony home info display (kiosk) sample, zero third-party dependencies.",
+  "main": "",
+  "author": "local",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}
