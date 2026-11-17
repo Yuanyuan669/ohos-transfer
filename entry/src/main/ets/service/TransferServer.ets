@@ -70,6 +70,8 @@ export class TransferServer {
   };
   public onFilesChanged: () => void = () => {
   };
+  private failCount: number = 0;
+  private lockUntil: number = 0;
 
   constructor(inboxDir: string) {
     this.inbox = inboxDir;
@@ -250,10 +252,22 @@ export class TransferServer {
 
   private handle(conn: socket.TCPSocketConnection, req: ParsedReq, body: Uint8Array): void {
     this.log(req.method + ' ' + req.path);
+    if (Date.now() < this.lockUntil) {
+      this.sendText(conn, 429, 'too many attempts');
+      return;
+    }
     if (!this.authorized(req)) {
+      this.failCount++;
+      if (this.failCount >= 5) {
+        this.lockUntil = Date.now() + 60000;
+        this.failCount = 0;
+        this.log('PIN 连续失败 5 次，锁定 60 秒');
+      }
       this.sendText(conn, 401, 'PIN 错误或缺失');
       return;
     }
+    this.failCount = 0;
+    this.lockUntil = 0;
     if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
       this.sendHtml(conn, this.pageHtml());
       return;
