@@ -13,3 +13,7 @@ test-*.bin
 test-note.txt
 pulled/
 docs/*.jpeg
+
+# test artifacts
+t.bin
+d.bin

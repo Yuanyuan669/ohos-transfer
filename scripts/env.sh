@@ -12,7 +12,7 @@ export OHOS_PROJECT_ROOT="$ENV_PROJ_ROOT"
 [ -f "$ENV_SH_DIR/env.local.sh" ] && . "$ENV_SH_DIR/env.local.sh"
 
 # --- Project identity -------------------------------------------------------
-export OHOS_BUNDLE="${OHOS_BUNDLE:-com.local.homekiosk}"
+export OHOS_BUNDLE="${OHOS_BUNDLE:-com.local.transfer}"
 export OHOS_ABILITY="${OHOS_ABILITY:-EntryAbility}"
 export OHOS_MODULE="${OHOS_MODULE:-entry}"
 export OHOS_PRODUCT="${OHOS_PRODUCT:-default}"
