@@ -4,6 +4,7 @@ import util from '@ohos.util';
 import { Log } from '../common/Logger';
 
 const MAX_BODY: number = 64 * 1024 * 1024;
+const MAX_UPLOAD: number = 8 * 1024 * 1024 * 1024;
 const CHUNK: number = 64 * 1024;
 
 interface MsgInfo {
@@ -23,6 +24,10 @@ class ConnState {
   chunks: Uint8Array = new Uint8Array(0);
   req: ParsedReq | null = null;
   handled: boolean = false;
+  uploadOpen: boolean = false;
+  uploadFd: number = -1;
+  uploadName: string = '';
+  uploadWritten: number = 0;
 }
 
 function encoder(): util.TextEncoder {
@@ -151,6 +156,10 @@ export class TransferServer {
         return;
       }
       const chunk: Uint8Array = new Uint8Array(info.message);
+      if (st.uploadOpen) {
+        this.writeUpload(conn, st, chunk);
+        return;
+      }
       st.chunks = concat(st.chunks, chunk);
       if (st.req === null) {
         const idx: number = headerEndIndex(st.chunks);
@@ -167,6 +176,40 @@ export class TransferServer {
           this.sendText(conn, 400, 'bad request');
           return;
         }
+        if (st.req.method === 'PUT' && st.req.path.indexOf('/u/') === 0) {
+          if (st.req.contentLength > MAX_UPLOAD) {
+            st.handled = true;
+            this.sendText(conn, 413, 'too large');
+            return;
+          }
+          if (!this.checkAuth(conn, st.req)) {
+            st.handled = true;
+            return;
+          }
+          const name: string = decodeURIComponent(st.req.path.substring(3));
+          if (!safeName(name)) {
+            st.handled = true;
+            this.sendText(conn, 400, 'bad name');
+            return;
+          }
+          const fd: number = this.openUpload(name);
+          if (fd < 0) {
+            st.handled = true;
+            this.sendText(conn, 500, 'open failed');
+            return;
+          }
+          st.uploadOpen = true;
+          st.uploadFd = fd;
+          st.uploadName = name;
+          st.uploadWritten = 0;
+          const first: Uint8Array = st.chunks.subarray(st.req.headerLen);
+          st.chunks = new Uint8Array(0);
+          this.writeUpload(conn, st, first);
+          return;
+        }
+      }
+      if (st.req === null) {
+        return;
       }
       const need: number = st.req.headerLen + st.req.contentLength;
       if (st.chunks.length < need) {
@@ -181,9 +224,59 @@ export class TransferServer {
       this.handle(conn, st.req, body);
     });
     conn.on('close', () => {
+      const s: ConnState | null = this.states.get(id) ?? null;
+      if (s !== null && s.uploadOpen) {
+        try {
+          fs.closeSync(s.uploadFd);
+        } catch (e) {
+        }
+        this.log('上传中断 ' + s.uploadName + ' ' + s.uploadWritten + 'B');
+      }
       this.states.delete(id);
       this.log('连接关闭 #' + id);
     });
+  }
+
+  private openUpload(name: string): number {
+    try {
+      const path: string = this.inbox + '/' + name;
+      try {
+        fs.unlinkSync(path);
+      } catch (e) {
+      }
+      return fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC).fd;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  private writeUpload(conn: socket.TCPSocketConnection, st: ConnState, data: Uint8Array): void {
+    if (data.length > 0) {
+      try {
+        fs.writeSync(st.uploadFd, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+        st.uploadWritten += data.length;
+      } catch (e) {
+        st.handled = true;
+        st.uploadOpen = false;
+        try {
+          fs.closeSync(st.uploadFd);
+        } catch (e2) {
+        }
+        this.sendText(conn, 500, 'write failed');
+        return;
+      }
+    }
+    if (st.req !== null && st.uploadWritten >= st.req.contentLength) {
+      st.handled = true;
+      st.uploadOpen = false;
+      try {
+        fs.closeSync(st.uploadFd);
+      } catch (e) {
+      }
+      this.log('上传完成 ' + st.uploadName + ' ' + st.uploadWritten + 'B');
+      this.sendJson(conn, '{"ok":true,"name":"' + this.escapeJson(st.uploadName) + '"}');
+      this.onFilesChanged();
+    }
   }
 
   private parseRequest(buf: Uint8Array, headerEnd: number): ParsedReq | null {
@@ -250,11 +343,10 @@ export class TransferServer {
     return h !== undefined && h === this.pin;
   }
 
-  private handle(conn: socket.TCPSocketConnection, req: ParsedReq, body: Uint8Array): void {
-    this.log(req.method + ' ' + req.path);
+  private checkAuth(conn: socket.TCPSocketConnection, req: ParsedReq): boolean {
     if (Date.now() < this.lockUntil) {
       this.sendText(conn, 429, 'too many attempts');
-      return;
+      return false;
     }
     if (!this.authorized(req)) {
       this.failCount++;
@@ -264,10 +356,18 @@ export class TransferServer {
         this.log('PIN 连续失败 5 次，锁定 60 秒');
       }
       this.sendText(conn, 401, 'PIN 错误或缺失');
-      return;
+      return false;
     }
     this.failCount = 0;
     this.lockUntil = 0;
+    return true;
+  }
+
+  private handle(conn: socket.TCPSocketConnection, req: ParsedReq, body: Uint8Array): void {
+    this.log(req.method + ' ' + req.path);
+    if (!this.checkAuth(conn, req)) {
+      return;
+    }
     if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
       this.sendHtml(conn, this.pageHtml());
       return;
