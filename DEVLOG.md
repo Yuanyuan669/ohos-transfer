@@ -1,7 +1,7 @@
 # ohos-transfer DEVLOG
 
 > 目的：记录设计决策、踩坑与当前状态，避免上下文压缩后重复踩坑。
-> 相关：`D:\ohos-device\docs\APP-ROADMAP.md`、`docs/research/APP-FILETRANSFER.md`
+> 相关：`ohos-device/docs/APP-ROADMAP.md`、`docs/research/APP-FILETRANSFER.md`
 
 ## 2026-11-17 MVP
 
