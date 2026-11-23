@@ -59,10 +59,40 @@
   日志不再刷「连接关闭」。截图：`build-artifacts/preview-image.jpeg`、`preview-text.jpeg`、
   `preview-text-long-top.jpeg`、`preview-text-long-scroll.jpeg`、`preview-unsupported.jpeg`。
 
+## 2026-11-23 限流体感 / PIN 轮换 / 下载内联 / 保存相册 / 图片选择
+
+针对「429 只有英文、旧标签继续轮询打满限流、选文件不能选图片、图片只能预览不能存」这一批反馈：
+
+- **429 长中文 + Retry-After + 前端倒计时**：`checkAuth` 锁定期间返回
+  `429 + Retry-After: <剩余秒>`、body「尝试次数过多，请 N 秒后重试」；新增 `sendError`。
+  前端 `load()/up()` 读到 429 时停轮询，按 `Retry-After` 倒计时并自动恢复（`showCountdown`）。
+- **失败只计「真正错误的 PIN」**：
+  - 未知路径先 `classify` 再鉴权 → 未知路径直接 404，不触发 PIN 计数，避免正常探测被误判爆破；
+  - 未携带 PIN（query 与 `x-pin` 都没有）→ 401「PIN 缺失」，但不计数；
+  - 只有「带了 PIN 但不对」才计数，5 次锁定 60 s，401 文案带剩余可尝试次数。
+- **PIN 轮换后前端提示**：鉴权走 `providedPin`（query 或 `x-pin`）。旧标签用旧 PIN 会拿到 401，
+  前端读到 401 调 `pinChanged()`：停轮询 + 顶部横幅「PIN 已更新，请用 App 当前显示的地址重新打开本页」。
+- **下载 inline/attachment 区分**：`sendFile` 按扩展名给图片 `Content-Type: image/...` + `Content-Disposition: inline`，
+  其余 `application/octet-stream` + `attachment`；`/api/list` 不变（name+size）。
+  实测：png → `image/png` + `inline`；txt → `application/octet-stream` + `attachment`。
+- **设备端保存到相册**：预览覆盖层对图片加 `SaveButton`（安全组件）→ `SUCCESS` 后调
+  `service/AlbumSaver.ets` 用 `photoAccessHelper.createAsset(PhotoType.IMAGE, ext)` + `fs.openSync(uri, WRITE_ONLY)`
+  写字节。普通应用无 `WRITE_IMAGEVIDEO` ACL 也能用（安全组件给临时授权）。真机实测「已保存到相册」成功。
+- **手机端选图片**：收件箱头部拆成「图片 / 文件」两个入口；「图片」用 `PhotoViewPicker`（`IMAGE_TYPE`）→
+  取 `photoUris` 复制进 inbox（末段无扩展名时补 `.jpg`）。
+- **迁移整理**：`importFiles`（文档）与 `importPhotos` 共用 `copyToInbox(uri, name)`；结果写 UI 日志（`appendLog`），
+  与 hilog 解耦。
+
+真机/直连实测（PC `192.168.31.100` → 手机 `192.168.31.91:8080`，用 node fetch 校验 UTF-8）：
+正确 PIN=200、无 PIN=401「PIN 缺失」、错 PIN=401「PIN 错误（还可尝试 N 次）」、第 5 次=429（`Retry-After: 60`）、
+未知路径=404 `not found`；`/f/` 图片 inline/非图片 attachment 均符合预期（见 `scripts` 未记录的 `Temp/opencode/verify.mjs`）。
+
 ## 待办
 
-- M3：picker 可以列出 Download 下 2 个文件，但返回的 `file://docs/...` 在 OH 4.1.7.5 普通应用读不了
-  （`13900001`，nweb 侧 `err=-13`；`fileShare.persistPermission` 也返回 801），`importFiles` 目前无法真正导入。
-  需要更底层授权（系统应用 / ACL）或改用媒体库 PhotoViewPicker 的媒体路径。
+- M3：文档导入仍受限——`DocumentViewPicker` 返回的 `file://docs/...` 在 OH 4.1.7.5 普通应用读不了
+  （`13900001`，nweb 侧 `err=-13`；`fileShare.persistPermission` 也返回 801）。图片导入已改走
+  `PhotoViewPicker`（媒体临时读授权，路径可读），文档导入仍需更底层授权（系统应用 / ACL）。
+- 自动「接收后即存相册」开关：普通应用无 `WRITE_IMAGEVIDEO` ACL，静默写媒体库不可行；
+  现有方案是每次预览用 `SaveButton` 安全组件手动授权保存，故不做设置开关（会误导用户）。
 - M5：1GB 压测、Wi-Fi 抖动、并发。
 - 可选：`PUT` 支持 chunked/分片、断点续传。

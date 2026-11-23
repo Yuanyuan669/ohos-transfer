@@ -5,6 +5,7 @@ import picker from '@ohos.file.picker';
 import connection from '@ohos.net.connection';
 import { TransferServer } from '../service/TransferServer';
 import { PreviewSource } from '../service/PreviewSource';
+import { AlbumSaver } from '../service/AlbumSaver';
 import { Log } from '../common/Logger';
 
 @Entry
@@ -85,7 +86,7 @@ struct Index {
     for (let i = 0; i < names.length; i++) {
       total += this.server.sizeOf(names[i]);
     }
-    this.sizeText = names.length + ' 个文件 · ' + this.human(total) + ' · 点按预览';
+    this.sizeText = names.length + ' 个文件 · ' + this.human(total);
   }
 
   private human(n: number): string {
@@ -138,6 +139,18 @@ struct Index {
     this.releasePreviewPhoto();
   }
 
+  private saveToAlbum(): void {
+    if (!AlbumSaver.isImage(this.previewTitle)) {
+      this.appendLog('该文件不是图片，无法保存到相册');
+      return;
+    }
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    const path: string = this.inbox + '/' + this.previewTitle;
+    AlbumSaver.saveImage(ctx, path, this.previewTitle).then((ok: boolean) => {
+      this.appendLog(ok ? ('已保存到相册：' + this.previewTitle) : '保存到相册失败');
+    });
+  }
+
   private releasePreviewPhoto(): void {
     const pm: image.PixelMap | null = this.previewPhoto;
     this.previewPhoto = null;
@@ -172,22 +185,50 @@ struct Index {
 
   private async importFiles(): Promise<void> {
     try {
-      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
       const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
       options.maxSelectNumber = 20;
       const p: picker.DocumentViewPicker = new picker.DocumentViewPicker();
       const uris: string[] = await p.select(options);
+      let ok: number = 0;
       for (let i = 0; i < uris.length; i++) {
-        this.copyIntoInbox(uris[i]);
+        if (this.copyToInbox(uris[i], this.nameFromUri(uris[i]))) {
+          ok++;
+        }
       }
       this.loadFiles();
-      this.server?.onLog('已导入 ' + uris.length + ' 个文件');
+      this.appendLog('已导入 ' + ok + ' 个文件');
     } catch (e) {
-      Log.warn('picker failed: ' + (e as Error).message);
+      Log.warn('document picker failed: ' + (e as Error).message);
     }
   }
 
-  private copyIntoInbox(uri: string): void {
+  private async importPhotos(): Promise<void> {
+    try {
+      const po: picker.PhotoSelectOptions = new picker.PhotoSelectOptions();
+      po.MIMEType = picker.PhotoViewMIMETypes.IMAGE_TYPE;
+      po.maxSelectNumber = 20;
+      const pv: picker.PhotoViewPicker = new picker.PhotoViewPicker();
+      const res: picker.PhotoSelectResult = await pv.select(po);
+      const uris: string[] = res.photoUris;
+      let ok: number = 0;
+      for (let i = 0; i < uris.length; i++) {
+        let name: string = this.nameFromUri(uris[i]);
+        // 相册 uri 的末段可能不带扩展名，补一个默认值，保证后续预览/保存能识别类型。
+        if (name.lastIndexOf('.') < 0) {
+          name = name + '.jpg';
+        }
+        if (this.copyToInbox(uris[i], name)) {
+          ok++;
+        }
+      }
+      this.loadFiles();
+      this.appendLog('已导入 ' + ok + ' 张图片');
+    } catch (e) {
+      Log.warn('photo picker failed: ' + (e as Error).message);
+    }
+  }
+
+  private nameFromUri(uri: string): string {
     let name: string = uri;
     const slash: number = name.lastIndexOf('/');
     if (slash >= 0) {
@@ -197,19 +238,33 @@ struct Index {
       name = decodeURIComponent(name);
     } catch (e) {
     }
+    return name;
+  }
+
+  private copyToInbox(uri: string, name: string): boolean {
+    if (name.length === 0 || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf('..') >= 0) {
+      name = 'import_' + Date.now();
+    }
     const dest: string = this.inbox + '/' + name;
-    const src: fs.File = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-    const dst: fs.File = fs.openSync(dest, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
-    const buf: ArrayBuffer = new ArrayBuffer(64 * 1024);
-    let read: number = 0;
-    do {
-      read = fs.readSync(src.fd, buf, { offset: 0, length: buf.byteLength });
-      if (read > 0) {
-        fs.writeSync(dst.fd, buf.slice(0, read));
-      }
-    } while (read > 0);
-    fs.closeSync(src.fd);
-    fs.closeSync(dst.fd);
+    try {
+      const src: fs.File = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      const dst: fs.File = fs.openSync(dest, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      const buf: ArrayBuffer = new ArrayBuffer(64 * 1024);
+      let read: number = 0;
+      do {
+        read = fs.readSync(src.fd, buf, { offset: 0, length: buf.byteLength });
+        if (read > 0) {
+          fs.writeSync(dst.fd, buf.slice(0, read));
+        }
+      } while (read > 0);
+      fs.closeSync(src.fd);
+      fs.closeSync(dst.fd);
+      return true;
+    } catch (e) {
+      Log.warn('import copy failed ' + name + ': ' + (e as Error).message);
+      this.appendLog('导入失败：' + name);
+      return false;
+    }
   }
 
   @Builder
@@ -251,6 +306,26 @@ struct Index {
         .onClick(() => {
           this.closePreview();
         })
+
+        if (AlbumSaver.isImage(this.previewTitle)) {
+          Row() {
+            SaveButton({
+              icon: SaveIconStyle.LINES,
+              text: SaveDescription.SAVE_IMAGE,
+              buttonType: ButtonType.Capsule
+            })
+              .onClick((event: ClickEvent, result: SaveButtonOnClickResult) => {
+                if (result === SaveButtonOnClickResult.SUCCESS) {
+                  this.saveToAlbum();
+                } else {
+                  this.appendLog('保存授权失败，请重试');
+                }
+              })
+          }
+          .width('100%')
+          .justifyContent(FlexAlign.Center)
+          .padding({ top: 8, bottom: 20 })
+        }
       } else {
         Scroll() {
           Column() {
@@ -326,19 +401,27 @@ struct Index {
       .backgroundColor('#151A21')
       .borderRadius(14)
 
-      Row() {
+      Row({ space: 6 }) {
         Text('收件箱')
           .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor('#E7EDF5')
-          .layoutWeight(1)
         Text(this.sizeText)
-          .fontSize(12)
+          .fontSize(11)
           .fontColor('#8FA0B5')
-        Button('导入文件')
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Button('图片')
           .fontSize(12)
           .height(30)
-          .margin({ left: 10 })
+          .backgroundColor('#243041')
+          .onClick(() => {
+            this.importPhotos();
+          })
+        Button('文件')
+          .fontSize(12)
+          .height(30)
           .backgroundColor('#243041')
           .onClick(() => {
             this.importFiles();

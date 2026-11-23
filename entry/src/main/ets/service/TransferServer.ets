@@ -334,6 +334,18 @@ export class TransferServer {
     }
   }
 
+  private providedPin(req: ParsedReq): string | undefined {
+    const q: string | undefined = req.query.get('pin');
+    if (q !== undefined && q.length > 0) {
+      return q;
+    }
+    const h: string | undefined = req.headers.get('x-pin');
+    if (h !== undefined && h.length > 0) {
+      return h;
+    }
+    return undefined;
+  }
+
   private authorized(req: ParsedReq): boolean {
     const q: string | undefined = req.query.get('pin');
     if (q !== undefined && q === this.pin) {
@@ -344,35 +356,66 @@ export class TransferServer {
   }
 
   private checkAuth(conn: socket.TCPSocketConnection, req: ParsedReq): boolean {
-    if (Date.now() < this.lockUntil) {
-      this.sendText(conn, 429, 'too many attempts');
+    const now: number = Date.now();
+    if (now < this.lockUntil) {
+      const waitSec: number = Math.ceil((this.lockUntil - now) / 1000);
+      this.sendError(conn, 429, '尝试次数过多，请 ' + waitSec + ' 秒后重试', waitSec);
       return false;
     }
-    if (!this.authorized(req)) {
-      this.failCount++;
-      if (this.failCount >= 5) {
-        this.lockUntil = Date.now() + 60000;
-        this.failCount = 0;
-        this.log('PIN 连续失败 5 次，锁定 60 秒');
-      }
-      this.sendText(conn, 401, 'PIN 错误或缺失');
+    if (this.providedPin(req) === undefined) {
+      // 未携带 PIN：直接 401，不计入失败次数，避免正常探测/旧页面空请求被误判为爆破。
+      this.sendText(conn, 401, 'PIN 缺失');
       return false;
     }
-    this.failCount = 0;
-    this.lockUntil = 0;
-    return true;
+    if (this.authorized(req)) {
+      this.failCount = 0;
+      this.lockUntil = 0;
+      return true;
+    }
+    this.failCount++;
+    if (this.failCount >= 5) {
+      this.lockUntil = now + 60000;
+      this.failCount = 0;
+      this.log('PIN 连续错误 5 次，锁定 60 秒');
+      this.sendError(conn, 429, '尝试次数过多，请 60 秒后重试', 60);
+      return false;
+    }
+    this.sendText(conn, 401, 'PIN 错误（还可尝试 ' + (5 - this.failCount) + ' 次）');
+    return false;
+  }
+
+  private classify(req: ParsedReq): string {
+    if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
+      return 'page';
+    }
+    if (req.method === 'GET' && req.path === '/api/list') {
+      return 'list';
+    }
+    if (req.method === 'GET' && req.path.indexOf('/f/') === 0) {
+      return 'file';
+    }
+    if ((req.method === 'PUT' || req.method === 'POST') && req.path.indexOf('/u/') === 0) {
+      return 'upload';
+    }
+    return '';
   }
 
   private handle(conn: socket.TCPSocketConnection, req: ParsedReq, body: Uint8Array): void {
     this.log(req.method + ' ' + req.path);
+    const route: string = this.classify(req);
+    if (route.length === 0) {
+      // 未知路径：404，且不计入 PIN 失败次数（避免正常探测被误判为爆破）。
+      this.sendText(conn, 404, 'not found');
+      return;
+    }
     if (!this.checkAuth(conn, req)) {
       return;
     }
-    if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
+    if (route === 'page') {
       this.sendHtml(conn, this.pageHtml());
       return;
     }
-    if (req.method === 'GET' && req.path === '/api/list') {
+    if (route === 'list') {
       const names: string[] = this.listFiles();
       const items: string[] = [];
       for (let i = 0; i < names.length; i++) {
@@ -381,7 +424,7 @@ export class TransferServer {
       this.sendJson(conn, '{"files":[' + items.join(',') + ']}');
       return;
     }
-    if (req.method === 'GET' && req.path.indexOf('/f/') === 0) {
+    if (route === 'file') {
       const name: string = decodeURIComponent(req.path.substring(3));
       if (!safeName(name)) {
         this.sendText(conn, 400, 'bad name');
@@ -390,7 +433,7 @@ export class TransferServer {
       this.sendFile(conn, name);
       return;
     }
-    if ((req.method === 'PUT' || req.method === 'POST') && req.path.indexOf('/u/') === 0) {
+    if (route === 'upload') {
       const name: string = decodeURIComponent(req.path.substring(3));
       if (!safeName(name)) {
         this.sendText(conn, 400, 'bad name');
@@ -407,6 +450,22 @@ export class TransferServer {
     const head: string = 'HTTP/1.1 ' + code + ' ' + (code === 200 ? 'OK' : 'ERR')
       + '\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ' + bytes.length
       + '\r\nConnection: close\r\n\r\n';
+    conn.send({ data: head }).then(() => {
+      return conn.send({ data: bytes.buffer });
+    }).then(() => {
+      conn.close();
+    }).catch(() => {
+      try {
+        conn.close();
+      } catch (e) {
+      }
+    });
+  }
+
+  private sendError(conn: socket.TCPSocketConnection, code: number, text: string, retryAfterSec: number): void {
+    const bytes: Uint8Array = encoder().encode(text);
+    const head: string = 'HTTP/1.1 ' + code + ' ERR\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: '
+      + bytes.length + '\r\nRetry-After: ' + retryAfterSec + '\r\nConnection: close\r\n\r\n';
     conn.send({ data: head }).then(() => {
       return conn.send({ data: bytes.buffer });
     }).then(() => {
@@ -451,6 +510,34 @@ export class TransferServer {
     });
   }
 
+  private extOf(name: string): string {
+    const dot: number = name.lastIndexOf('.');
+    if (dot < 0) {
+      return '';
+    }
+    return name.substring(dot + 1).toLowerCase();
+  }
+
+  private mimeFor(name: string): string {
+    const e: string = this.extOf(name);
+    if (e === 'jpg' || e === 'jpeg') {
+      return 'image/jpeg';
+    }
+    if (e === 'png') {
+      return 'image/png';
+    }
+    if (e === 'gif') {
+      return 'image/gif';
+    }
+    if (e === 'webp') {
+      return 'image/webp';
+    }
+    if (e === 'bmp') {
+      return 'image/bmp';
+    }
+    return '';
+  }
+
   private sendFile(conn: socket.TCPSocketConnection, name: string): void {
     const path: string = this.inbox + '/' + name;
     let file: fs.File | null = null;
@@ -462,9 +549,13 @@ export class TransferServer {
       this.sendText(conn, 404, 'file not found');
       return;
     }
-    const head: string = 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: '
-      + size + '\r\nContent-Disposition: attachment; filename*=UTF-8\'\''
-      + encodeURIComponent(name) + '\r\nConnection: close\r\n\r\n';
+    const mime: string = this.mimeFor(name);
+    // 图片让浏览器直接 inline 预览，其余走 attachment 下载。
+    const disposition: string = mime.length > 0 ? 'inline' : 'attachment';
+    const head: string = 'HTTP/1.1 200 OK\r\nContent-Type: ' + (mime.length > 0 ? mime : 'application/octet-stream')
+      + '\r\nContent-Length: ' + size
+      + '\r\nContent-Disposition: ' + disposition + '; filename*=UTF-8\'\''
+      + encodeURIComponent(name) + '\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n';
     let offset: number = 0;
     const buf: ArrayBuffer = new ArrayBuffer(CHUNK);
     conn.send({ data: head }).then(async () => {
@@ -526,24 +617,53 @@ export class TransferServer {
       + 'input[type=file]{display:none}button{background:#2f6fed;color:#fff;border:0;border-radius:9px;padding:10px 16px;font-size:14px;cursor:pointer}'
       + '#list{margin-top:22px}.row{display:flex;justify-content:space-between;align-items:center;padding:11px 4px;border-bottom:1px solid #232b35;font-size:14px}'
       + 'a{color:#6ea8ff;text-decoration:none}.muted{color:#72839a;font-size:12px}'
+      + '#status{margin-top:16px;padding:12px 14px;border-radius:10px;font-size:14px;display:none}'
+      + '#status.warn{background:#2a2113;color:#ffb020}#status.err{background:#2a1616;color:#ff7b7b}'
       + '</style></head><body>'
       + '<h1>快传 · 手机与电脑互传</h1><div class="sub">PIN ' + pin + ' · 拖拽文件到下面，或点击选择</div>'
       + '<div class="drop" id="drop">把文件拖到这里，或<label for="f" style="color:#6ea8ff;cursor:pointer">点击选择</label>'
-      + '<input id="f" type="file" multiple></div><div id="list"></div>'
+      + '<input id="f" type="file" multiple></div><div id="status"></div><div id="list"></div>'
       + '<script>var PIN="' + pin + '";'
+      + 'var pollTimer=null,retryTimer=null;'
       + 'function fmt(n){if(n<1024)return n+" B";if(n<1048576)return (n/1024).toFixed(1)+" KB";return (n/1048576).toFixed(1)+" MB"}'
-      + 'function load(){fetch("/api/list?pin="+PIN).then(function(r){return r.json()}).then(function(j){'
-      + 'var h="";j.files.forEach(function(f){h+=\'<div class="row"><span>\'+f.name+\' <span class="muted">\'+fmt(f.size)+\'</span></span>\''
-      + '+\'<a href="/f/\'+encodeURIComponent(f.name)+\'?pin=\'+PIN+\'">下载</a></div>\'});'
-      + 'document.getElementById("list").innerHTML=h||\'<div class="muted" style="margin-top:18px">收件箱还是空的</div>\'})}'
+      + 'function setStatus(html,cls){var el=document.getElementById("status");el.className=cls||"";el.innerHTML=html;el.style.display=html?"block":"none"}'
+      + 'function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}'
+      + 'function startPolling(){stopPolling();pollTimer=setInterval(load,3000)}'
+      + 'function showCountdown(total,done){stopPolling();var left=total;'
+      + '  if(retryTimer){clearInterval(retryTimer)}'
+      + '  function tick(){setStatus("尝试次数过多，<b>"+left+"</b> 秒后自动重试…","warn");'
+      + '    if(left<=0){clearInterval(retryTimer);retryTimer=null;setStatus("");done()}'
+      + '    }'
+      + '  tick();retryTimer=setInterval(function(){left--;tick()},1000)}'
+      + 'function pinChanged(){stopPolling();if(retryTimer){clearInterval(retryTimer);retryTimer=null}'
+      + '  setStatus("PIN 已更新，请用 App 当前显示的地址重新打开本页（不要再用旧标签）","warn")}'
+      + 'function load(){'
+      + '  fetch("/api/list?pin="+PIN,{cache:"no-store"}).then(function(r){'
+      + '    return r.json().then(function(j){return {code:r.status,body:j,retry:r.headers.get("Retry-After")}},'
+      + '      function(){return {code:r.status,body:null,retry:r.headers.get("Retry-After")}})'
+      + '  }).then(function(res){'
+      + '    if(res.code===200&&res.body){'
+      + '      var j=res.body,h="";j.files.forEach(function(f){h+=\'<div class="row"><span>\'+f.name+\' <span class="muted">\'+fmt(f.size)+\'</span></span>\''
+      + '        +\'<a href="/f/\'+encodeURIComponent(f.name)+\'?pin=\'+PIN+\'">下载</a></div>\'});'
+      + '      document.getElementById("list").innerHTML=h||\'<div class="muted" style="margin-top:18px">收件箱还是空的</div>\';'
+      + '      setStatus("");return}'
+      + '    if(res.code===401){pinChanged();return}'
+      + '    if(res.code===429){var s=parseInt(res.retry,10);if(!(s>0))s=60;showCountdown(s,function(){startPolling()});return}'
+      + '    setStatus("列表刷新失败（HTTP "+res.code+"）","err")'
+      + '  }).catch(function(){if(!document.getElementById("status").innerHTML){setStatus("连接已断开，正在后台重试…","muted")}})}'
       + 'function up(files){var i=0;function next(){if(i>=files.length){load();return}var f=files[i++];'
-      + 'fetch("/u/"+encodeURIComponent(f.name)+"?pin="+PIN,{method:"PUT",body:f}).then(function(){next()},function(){alert("上传失败: "+f.name);next()})}next()}'
+      + 'fetch("/u/"+encodeURIComponent(f.name)+"?pin="+PIN,{method:"PUT",body:f}).then(function(r){'
+      + '  if(r.status===401){pinChanged();return}'
+      + '  if(r.status===429){var s=parseInt(r.headers.get("Retry-After"),10)||60;showCountdown(s,function(){startPolling()});return}'
+      + '  if(r.status>=400){setStatus("上传失败 "+f.name+"（HTTP "+r.status+"）","err")}'
+      + '  next()},function(){setStatus("上传失败 "+f.name,"err");next()})}next()}'
       + 'var d=document.getElementById("drop"),inp=document.getElementById("f");'
       + 'inp.onchange=function(){up(inp.files);inp.value=""};'
       + 'd.ondragover=function(e){e.preventDefault();d.classList.add("hover")};'
       + 'd.ondragleave=function(){d.classList.remove("hover")};'
       + 'd.ondrop=function(e){e.preventDefault();d.classList.remove("hover");up(e.dataTransfer.files)};'
-      + 'd.onclick=function(e){if(e.target===d){inp.click()}};load();setInterval(load,3000);'
+      + 'd.onclick=function(e){if(e.target===d){inp.click()}};'
+      + 'load();startPolling();'
       + '</script></body></html>';
   }
 }
