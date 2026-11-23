@@ -8,15 +8,26 @@ require_device
 
 [ -f "$OHOS_SIGNED_HAP" ] || fail "找不到 $OHOS_SIGNED_HAP。先跑 build.sh（若产物未签名再跑 sign.sh）"
 
-step "卸载旧版本（忽略不存在的情况）"
-hdc_run uninstall "$OHOS_BUNDLE" >/dev/null 2>&1 && ok "removed $OHOS_BUNDLE" || warn "无需卸载（未安装过）"
-
-step "安装 HAP"
+step "安装 HAP（-r 覆盖安装，保留 filesDir 收件箱）"
 # hdc on Windows mishandles some absolute paths; install from the file's directory.
 HAP_DIR="$(dirname "$OHOS_SIGNED_HAP")"; HAP_NAME="$(basename "$OHOS_SIGNED_HAP")"
-( cd "$HAP_DIR" && HDC="$HDC_BIN" && \
-  if [ -n "$OHOS_TARGET" ]; then "$HDC_BIN" -t "$OHOS_TARGET" install -r "$HAP_NAME"; else "$HDC_BIN" install -r "$HAP_NAME"; fi ) \
-  || fail "安装失败。按错误码排查：\n     9568322/9568313 签名或 Profile 与设备/包名不匹配 -> signing/README.md\n     9568289 签名材料不成套\n     InstallFailed.*api version 应用要求的 API 高于设备 -> 改 build-profile.json5 的 compatibleSdkVersion\n     [Fail]Connect  设备掉线 -> 重新 hdc tconn 或插拔 USB"
+install_hap() {
+  ( cd "$HAP_DIR" && \
+    if [ -n "$OHOS_TARGET" ]; then "$HDC_BIN" -t "$OHOS_TARGET" install -r "$HAP_NAME"; else "$HDC_BIN" install -r "$HAP_NAME"; fi )
+}
+ERR_HINT="安装失败。按错误码排查：\n     9568322/9568313 签名或 Profile 与设备/包名不匹配 -> signing/README.md\n     9568289 签名材料不成套\n     InstallFailed.*api version 应用要求的 API 高于设备 -> 改 build-profile.json5 的 compatibleSdkVersion\n     [Fail]Connect  设备掉线 -> 重新 hdc tconn 或插拔 USB"
+
+OUT="$(install_hap 2>&1 || true)"
+printf '%s\n' "$OUT" | sed 's/^/         /'
+# hdc 即使 install 失败也可能返回 0：必须看输出里的 msg:error，不能只看退出码。
+if printf '%s\n' "$OUT" | grep -q 'msg:error'; then
+  warn "覆盖安装被拒（常见：debug/release 类型不一致）。卸载后重装：filesDir（含收件箱）会被清空"
+  hdc_run uninstall "$OHOS_BUNDLE" >/dev/null 2>&1 || true
+  OUT="$(install_hap 2>&1 || true)"
+  printf '%s\n' "$OUT" | sed 's/^/         /'
+  printf '%s\n' "$OUT" | grep -q 'msg:error' && fail "$ERR_HINT"
+fi
+printf '%s\n' "$OUT" | grep -qi 'successfully' || fail "$ERR_HINT"
 ok "installed"
 
 step "启动 EntryAbility"
@@ -47,7 +58,7 @@ else
 fi
 
 step "关键日志 / 崩溃线索"
-hdc_run shell "hilog -x -T HomeKiosk | tail -n 25" 2>/dev/null | tr -d '\r' | sed 's/^/         /' || true
+hdc_run shell "hilog -x -T HomeTransfer | tail -n 25" 2>/dev/null | tr -d '\r' | sed 's/^/         /' || true
 hdc_run shell "ls -t /data/log/faultlog/faultlogger 2>/dev/null | head -n 3" 2>/dev/null | tr -d '\r' | sed 's/^/    crash: /' || true
 
 step "完成"

@@ -1,8 +1,10 @@
 import common from '@ohos.app.ability.common';
 import fs from '@ohos.file.fs';
+import image from '@ohos.multimedia.image';
 import picker from '@ohos.file.picker';
 import connection from '@ohos.net.connection';
 import { TransferServer } from '../service/TransferServer';
+import { PreviewSource } from '../service/PreviewSource';
 import { Log } from '../common/Logger';
 
 @Entry
@@ -14,6 +16,11 @@ struct Index {
   @State logText: string = '';
   @State files: string[] = [];
   @State sizeText: string = '';
+  @State showPreview: boolean = false;
+  @State previewTitle: string = '';
+  @State previewKind: string = '';
+  @State previewText: string = '';
+  @State previewPhoto: image.PixelMap | null = null;
   private server: TransferServer | null = null;
   private inbox: string = '';
 
@@ -22,7 +29,11 @@ struct Index {
     this.inbox = ctx.filesDir + '/inbox';
     this.server = new TransferServer(this.inbox);
     this.server.onLog = (line: string) => {
-      this.logText = (line + '\n' + this.logText).substring(0, 1200);
+      // 电脑端每 3 秒轮询 /api/list，会持续刷「连接关闭 #id」，对用户是误导。
+      if (line.indexOf('连接关闭') === 0) {
+        return;
+      }
+      this.appendLog(line);
     };
     this.server.onFilesChanged = () => {
       this.loadFiles();
@@ -32,6 +43,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.closePreview();
     if (this.server !== null) {
       this.server.stop();
     }
@@ -59,6 +71,10 @@ struct Index {
     }
   }
 
+  private appendLog(line: string): void {
+    this.logText = (line + '\n' + this.logText).substring(0, 1200);
+  }
+
   private loadFiles(): void {
     if (this.server === null) {
       return;
@@ -69,7 +85,7 @@ struct Index {
     for (let i = 0; i < names.length; i++) {
       total += this.server.sizeOf(names[i]);
     }
-    this.sizeText = names.length + ' 个文件 · ' + this.human(total);
+    this.sizeText = names.length + ' 个文件 · ' + this.human(total) + ' · 点按预览';
   }
 
   private human(n: number): string {
@@ -83,6 +99,51 @@ struct Index {
       return (n / 1048576).toFixed(1) + ' MB';
     }
     return (n / 1073741824).toFixed(2) + ' GB';
+  }
+
+  private openPreview(name: string): void {
+    const kind: string = PreviewSource.kind(name);
+    Log.info('preview tap ' + name + ' kind=' + kind);
+    if (kind.length === 0) {
+      this.appendLog('『' + name + '』暂不支持预览，请在电脑端下载');
+      return;
+    }
+    const path: string = this.inbox + '/' + name;
+    this.closePreview();
+    this.previewTitle = name;
+    this.previewKind = kind;
+    if (kind === 'image') {
+      this.showPreview = true;
+      PreviewSource.decodeImage(path).then((pm: image.PixelMap | null) => {
+        if (pm === null) {
+          this.closePreview();
+          this.appendLog('图片解码失败：' + name);
+          return;
+        }
+        if (!this.showPreview || this.previewTitle !== name) {
+          PreviewSource.releaseMap(pm);
+          return;
+        }
+        this.previewPhoto = pm;
+      });
+    } else {
+      this.previewText = PreviewSource.readText(path);
+      this.showPreview = true;
+    }
+  }
+
+  private closePreview(): void {
+    this.showPreview = false;
+    this.previewText = '';
+    this.releasePreviewPhoto();
+  }
+
+  private releasePreviewPhoto(): void {
+    const pm: image.PixelMap | null = this.previewPhoto;
+    this.previewPhoto = null;
+    if (pm !== null) {
+      PreviewSource.releaseMap(pm);
+    }
   }
 
   private refreshIp(): void {
@@ -149,6 +210,69 @@ struct Index {
     } while (read > 0);
     fs.closeSync(src.fd);
     fs.closeSync(dst.fd);
+  }
+
+  @Builder
+  PreviewOverlay() {
+    Column() {
+      Row() {
+        Text(this.previewTitle)
+          .fontSize(15)
+          .fontColor('#E7EDF5')
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Button('关闭')
+          .fontSize(13)
+          .height(30)
+          .backgroundColor('#243041')
+          .onClick(() => {
+            this.closePreview();
+          })
+      }
+      .width('100%')
+      .padding({ left: 18, right: 18, top: 44, bottom: 10 })
+
+      if (this.previewKind === 'image') {
+        Column() {
+          if (this.previewPhoto !== null) {
+            Image(this.previewPhoto)
+              .objectFit(ImageFit.Contain)
+              .width('100%')
+              .height('100%')
+          } else {
+            Text('解码中…')
+              .fontSize(14)
+              .fontColor('#8FA0B5')
+          }
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .onClick(() => {
+          this.closePreview();
+        })
+      } else {
+        Scroll() {
+          Column() {
+            Text(this.previewText.length > 0 ? this.previewText : '（空文件）')
+              .fontSize(12)
+              .fontColor('#D5DEEC')
+              .width('100%')
+              .textAlign(TextAlign.Start)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .constraintSize({ minHeight: '100%' })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 18, right: 18, bottom: 14 })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#0B0E12')
+    .alignItems(HorizontalAlign.Start)
   }
 
   build() {
@@ -242,6 +366,9 @@ struct Index {
             .padding({ left: 4, right: 4, top: 8, bottom: 8 })
             .border({ width: { bottom: 1 }, color: '#232B35' })
           }
+          .onClick(() => {
+            this.openPreview(name);
+          })
         }, (name: string) => name)
       }
       .width('100%')
@@ -259,5 +386,10 @@ struct Index {
     .height('100%')
     .padding({ left: 22, right: 22, top: 24, bottom: 16 })
     .backgroundColor('#0F1216')
+    .bindContentCover($$this.showPreview, this.PreviewOverlay(), {
+      onDisappear: () => {
+        this.releasePreviewPhoto();
+      }
+    })
   }
 }

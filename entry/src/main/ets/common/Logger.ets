@@ -1,7 +1,7 @@
 import hilog from '@ohos.hilog';
 
 const DOMAIN: number = 0x0FFF;
-const TAG: string = 'HomeKiosk';
+const TAG: string = 'HomeTransfer';
 
 export class Log {
   static info(msg: string): void {
