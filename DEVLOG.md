@@ -87,6 +87,37 @@
 正确 PIN=200、无 PIN=401「PIN 缺失」、错 PIN=401「PIN 错误（还可尝试 N 次）」、第 5 次=429（`Retry-After: 60`）、
 未知路径=404 `not found`；`/f/` 图片 inline/非图片 attachment 均符合预期（见 `scripts` 未记录的 `Temp/opencode/verify.mjs`）。
 
+## 2026-11-23 修复「图片导入 200MB+ / 点按钮卡死再点退出」
+
+用户反馈：选一张原图 + 一张普通截屏后点按钮卡住、再点就退出，重开发现两张图都显示 200 多 MB。
+
+根因（真机取证，非猜测）：
+
+- inbox 内 `IMG_20261123_221703.jpg`=240,975,872 B、`OhScreen_1795329852893.png`=262,012,928 B；
+  抓头部字节发现偏移 0 / 65536 / 131072 三处都是同一个 JPEG SOI（`ff d8 ff e0 …JFIF`）
+  → 文件内容是「开头 64KB 被反复写」。
+- 即 `PhotoViewPicker` 返回的媒体库 fd 在循环 `fs.readSync(fd, buf, {offset:0, length})` 下**读位置不前进**，
+  每次都返回开头 64KB，`do…while(read>0)` 永不收口；且整段是 UI 线程同步 IO，直接触发 ANR。
+- faultlog 佐证：`appfreeze-com.local.transfer-…202611232228{14,38}`，`Reason: THREAD_BLOCK_6S`，
+  PID 与当时进程一致。`AlbumSaver` 没炸是因为它读的是沙箱普通文件（fd 会前进），只有媒体库 fd 有此行为。
+
+修复（`entry/src/main/ets/pages/Index.ets`）：
+
+- `copyToInbox` 改异步：`fs.openSync(uri)` 拿授权 fd → `await fs.copyFile(src.fd, dest)`
+  （原生拷贝，不依赖 fd 位置语义、不阻塞主线程）。与 ohos-browser 已验证的 `copyFileSync(src.fd, dest)` 同一路数，仅改异步。
+- 大小护栏：先 `fs.statSync(uri).size`，超过 2GB（`MAX_IMPORT_BYTES`）直接拒；拷贝后 `fs.statSync(dest).size`
+  必须与源一致（且 >0、≤2GB），否则删掉半成品并记「导入失败（大小异常 got/srcSize）」——杜绝再留下 200MB 脏文件。
+- 拷贝前 `accessSync`+`unlinkSync` 清掉同名旧/脏文件；`finally` 里关 src fd。
+- `importFiles`/`importPhotos` 改 `await copyToInbox`，选择后先打「正在导入 N …」，避免用户误以为卡死。
+
+真机实测（1080×2408，`install -r` 保留收件箱）：
+
+- 导入原图 + 截屏：inbox 得 `IMG_20261115_174436.jpg`、`IMG_20261123_221703.jpg` 各 12,122,880 B（11.6MB，正确），
+  截屏 24,641 B 不变；连续多次导入 UI 不卡、日志正常刷「正在导入 / 已导入」。
+- 字节校验：头部 `ff d8 ff e0`（SOI）正常；offset 65536 处为 `00 2b 75 dc…`（图像数据，**非**第二个 SOI）→ 无重复块。
+- faultlog 无新增 appfreeze（仅旧的 22:28 两条），进程存活。
+- 顺手清掉了设备上两个 200MB 脏文件。
+
 ## 待办
 
 - M3：文档导入仍受限——`DocumentViewPicker` 返回的 `file://docs/...` 在 OH 4.1.7.5 普通应用读不了

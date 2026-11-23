@@ -8,6 +8,9 @@ import { PreviewSource } from '../service/PreviewSource';
 import { AlbumSaver } from '../service/AlbumSaver';
 import { Log } from '../common/Logger';
 
+// 导入大小上限：正常照片/文档远小于此，仅用于拦截异常膨胀（见 copyToInbox 注释）。
+const MAX_IMPORT_BYTES: number = 2 * 1024 * 1024 * 1024;
+
 @Entry
 @Component
 struct Index {
@@ -189,9 +192,13 @@ struct Index {
       options.maxSelectNumber = 20;
       const p: picker.DocumentViewPicker = new picker.DocumentViewPicker();
       const uris: string[] = await p.select(options);
+      if (uris.length === 0) {
+        return;
+      }
+      this.appendLog('正在导入 ' + uris.length + ' 个文件…');
       let ok: number = 0;
       for (let i = 0; i < uris.length; i++) {
-        if (this.copyToInbox(uris[i], this.nameFromUri(uris[i]))) {
+        if (await this.copyToInbox(uris[i], this.nameFromUri(uris[i]))) {
           ok++;
         }
       }
@@ -210,6 +217,10 @@ struct Index {
       const pv: picker.PhotoViewPicker = new picker.PhotoViewPicker();
       const res: picker.PhotoSelectResult = await pv.select(po);
       const uris: string[] = res.photoUris;
+      if (uris.length === 0) {
+        return;
+      }
+      this.appendLog('正在导入 ' + uris.length + ' 张图片…');
       let ok: number = 0;
       for (let i = 0; i < uris.length; i++) {
         let name: string = this.nameFromUri(uris[i]);
@@ -217,7 +228,7 @@ struct Index {
         if (name.lastIndexOf('.') < 0) {
           name = name + '.jpg';
         }
-        if (this.copyToInbox(uris[i], name)) {
+        if (await this.copyToInbox(uris[i], name)) {
           ok++;
         }
       }
@@ -241,29 +252,55 @@ struct Index {
     return name;
   }
 
-  private copyToInbox(uri: string, name: string): boolean {
+  private async copyToInbox(uri: string, name: string): Promise<boolean> {
     if (name.length === 0 || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf('..') >= 0) {
       name = 'import_' + Date.now();
     }
     const dest: string = this.inbox + '/' + name;
+    // PhotoViewPicker 返回的媒体库 fd 在循环 readSync 下不会前进，会反复读到开头 64KB；
+    // 旧的同步 do/while 据此死循环写出 200MB+ 重复块并阻塞 UI 线程触发 ANR（卡死后被系统杀）。
+    // 改用原生异步 copyFile：不依赖 fd 位置语义、不阻塞主线程，并用 statSync 校验真实大小。
+    let srcSize: number = -1;
     try {
-      const src: fs.File = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-      const dst: fs.File = fs.openSync(dest, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
-      const buf: ArrayBuffer = new ArrayBuffer(64 * 1024);
-      let read: number = 0;
-      do {
-        read = fs.readSync(src.fd, buf, { offset: 0, length: buf.byteLength });
-        if (read > 0) {
-          fs.writeSync(dst.fd, buf.slice(0, read));
-        }
-      } while (read > 0);
-      fs.closeSync(src.fd);
-      fs.closeSync(dst.fd);
+      srcSize = fs.statSync(uri).size;
+    } catch (e) {
+      srcSize = -1;
+    }
+    if (srcSize > MAX_IMPORT_BYTES) {
+      this.appendLog('导入失败：' + name + '（超过 2GB 上限）');
+      return false;
+    }
+    let src: fs.File | null = null;
+    try {
+      if (fs.accessSync(dest)) {
+        fs.unlinkSync(dest);
+      }
+      src = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      await fs.copyFile(src.fd, dest);
+      const got: number = fs.statSync(dest).size;
+      if (got <= 0 || got > MAX_IMPORT_BYTES || (srcSize > 0 && got !== srcSize)) {
+        fs.unlinkSync(dest);
+        this.appendLog('导入失败：' + name + '（大小异常 ' + got + '/' + srcSize + '）');
+        return false;
+      }
       return true;
     } catch (e) {
+      try {
+        if (fs.accessSync(dest)) {
+          fs.unlinkSync(dest);
+        }
+      } catch (e2) {
+      }
       Log.warn('import copy failed ' + name + ': ' + (e as Error).message);
       this.appendLog('导入失败：' + name);
       return false;
+    } finally {
+      if (src !== null) {
+        try {
+          fs.closeSync(src.fd);
+        } catch (e) {
+        }
+      }
     }
   }
 
